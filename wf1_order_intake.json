@@ -1,0 +1,193 @@
+{
+  "name": "WF1 - Order Intake & Validation",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "/orders",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-intake",
+      "name": "Webhook: Receive Order",
+      "type": "n8n-nodes-base.webhook",
+      "position": [240, 300],
+      "webhookId": "order-intake"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\nconst required = ['order_id', 'customer', 'items', 'priority'];\nconst missing = required.filter(f => !body[f]);\n\nif (missing.length > 0) {\n  throw new Error(`Missing required fields: ${missing.join(', ')}`);\n}\n\nif (!body.customer.email || !body.customer.name) {\n  throw new Error('Customer must have name and email');\n}\n\nif (!Array.isArray(body.items) || body.items.length === 0) {\n  throw new Error('Order must have at least one item');\n}\n\nfor (const item of body.items) {\n  if (!item.product_id || !item.quantity || item.quantity <= 0) {\n    throw new Error(`Invalid item: ${JSON.stringify(item)}`);\n  }\n}\n\nreturn [{ json: { ...body, validated_at: new Date().toISOString() } }];"
+      },
+      "id": "validate-fields",
+      "name": "Validate: Required Fields",
+      "type": "n8n-nodes-base.code",
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "=idempotency:{{ $json.order_id }}"
+      },
+      "id": "check-duplicate",
+      "name": "Redis: Check Idempotency Key",
+      "type": "n8n-nodes-base.redis",
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.value }}",
+              "operation": "isNotEmpty"
+            }
+          ]
+        }
+      },
+      "id": "is-duplicate",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'duplicate', message: 'Order already received', order_id: $json.order_id }) }}"
+      },
+      "id": "respond-duplicate",
+      "name": "Respond: 409 Duplicate",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1120, 180]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "=idempotency:{{ $json.order_id }}",
+        "value": "=processing:{{ new Date().toISOString() }}",
+        "keyType": "automatic",
+        "expire": true,
+        "ttl": 86400
+      },
+      "id": "set-idempotency",
+      "name": "Redis: Set Idempotency Key",
+      "type": "n8n-nodes-base.redis",
+      "position": [1120, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const order = $input.first().json;\nreturn [{\n  json: {\n    order_id: order.order_id,\n    customer: order.customer,\n    items: order.items,\n    priority: order.priority,\n    status: 'RECEIVED',\n    created_at: new Date().toISOString(),\n    updated_at: new Date().toISOString(),\n    history: [\n      { status: 'RECEIVED', ts: new Date().toISOString() }\n    ]\n  }\n}];"
+      },
+      "id": "build-order-state",
+      "name": "Build: Order State Object",
+      "type": "n8n-nodes-base.code",
+      "position": [1340, 420]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "orders",
+        "columns": "order_id,customer_name,customer_email,items,priority,status,created_at,updated_at,history",
+        "additionalFields": {}
+      },
+      "id": "db-insert-order",
+      "name": "DB: Insert Order Record",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1560, 420]
+    },
+    {
+      "parameters": {
+        "topic": "orders.validated",
+        "sendInputData": true,
+        "options": {
+          "partitionKey": "={{ $json.priority === 'high' ? '0' : '1' }}"
+        }
+      },
+      "id": "publish-validated",
+      "name": "Kafka: Publish to orders.validated",
+      "type": "n8n-nodes-base.kafka",
+      "position": [1780, 420]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'accepted', order_id: $json.order_id, message: 'Order queued for processing' }) }}"
+      },
+      "id": "respond-accepted",
+      "name": "Respond: 202 Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [2000, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "const error = $input.first().json.error || 'Validation failed';\nreturn [{ json: { error, order_id: $input.first().json.order_id || 'unknown' } }];"
+      },
+      "id": "handle-validation-error",
+      "name": "Handle Validation Error",
+      "type": "n8n-nodes-base.code",
+      "position": [680, 500]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "error_log",
+        "columns": "workflow,order_id,error,created_at",
+        "additionalFields": {}
+      },
+      "id": "log-error",
+      "name": "DB: Log Validation Error",
+      "type": "n8n-nodes-base.postgres",
+      "position": [900, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'error', message: $json.error }) }}",
+        "options": { "responseCode": 400 }
+      },
+      "id": "respond-error",
+      "name": "Respond: 400 Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "position": [1120, 500]
+    }
+  ],
+  "connections": {
+    "Webhook: Receive Order": {
+      "main": [[{ "node": "Validate: Required Fields", "type": "main", "index": 0 }]]
+    },
+    "Validate: Required Fields": {
+      "main": [[{ "node": "Redis: Check Idempotency Key", "type": "main", "index": 0 }]],
+      "error": [[{ "node": "Handle Validation Error", "type": "main", "index": 0 }]]
+    },
+    "Redis: Check Idempotency Key": {
+      "main": [[{ "node": "Is Duplicate?", "type": "main", "index": 0 }]]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [{ "node": "Respond: 409 Duplicate", "type": "main", "index": 0 }],
+        [{ "node": "Redis: Set Idempotency Key", "type": "main", "index": 0 }]
+      ]
+    },
+    "Redis: Set Idempotency Key": {
+      "main": [[{ "node": "Build: Order State Object", "type": "main", "index": 0 }]]
+    },
+    "Build: Order State Object": {
+      "main": [[{ "node": "DB: Insert Order Record", "type": "main", "index": 0 }]]
+    },
+    "DB: Insert Order Record": {
+      "main": [[{ "node": "Kafka: Publish to orders.validated", "type": "main", "index": 0 }]]
+    },
+    "Kafka: Publish to orders.validated": {
+      "main": [[{ "node": "Respond: 202 Accepted", "type": "main", "index": 0 }]]
+    },
+    "Handle Validation Error": {
+      "main": [[{ "node": "DB: Log Validation Error", "type": "main", "index": 0 }]]
+    },
+    "DB: Log Validation Error": {
+      "main": [[{ "node": "Respond: 400 Error", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "errorWorkflow": "WF7-ErrorHandler" },
+  "meta": { "description": "Validates incoming orders, checks for duplicates via idempotency keys, persists order state, and publishes to the processing queue." }
+}

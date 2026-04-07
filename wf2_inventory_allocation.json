@@ -1,0 +1,160 @@
+{
+  "name": "WF2 - Inventory Allocation",
+  "nodes": [
+    {
+      "parameters": {
+        "topic": "orders.validated",
+        "groupId": "inventory-allocator",
+        "options": { "autoCommit": false }
+      },
+      "id": "kafka-consume-validated",
+      "name": "Kafka: Consume orders.validated",
+      "type": "n8n-nodes-base.kafkaTrigger",
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the Kafka message\nconst msg = $input.first().json;\nconst order = typeof msg.value === 'string' ? JSON.parse(msg.value) : msg.value;\nreturn [{ json: order }];"
+      },
+      "id": "parse-message",
+      "name": "Parse: Kafka Message",
+      "type": "n8n-nodes-base.code",
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT product_id, warehouse_id, available_qty FROM inventory WHERE product_id = ANY(ARRAY[{{ $json.items.map(i => `'${i.product_id}'`).join(',') }}]::text[]) AND available_qty > 0 ORDER BY warehouse_id FOR UPDATE NOWAIT;"
+      },
+      "id": "fetch-inventory",
+      "name": "DB: Fetch Inventory WITH LOCK",
+      "type": "n8n-nodes-base.postgres",
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const order = $('Parse: Kafka Message').first().json;\nconst inventory = $input.all().map(i => i.json);\n\nconst allocations = [];\nconst backorders = [];\n\nfor (const item of order.items) {\n  let remaining = item.quantity;\n  const itemAllocs = [];\n\n  // Sort warehouses: closest/highest stock first (simplified: highest qty first)\n  const warehouses = inventory\n    .filter(r => r.product_id === item.product_id)\n    .sort((a, b) => b.available_qty - a.available_qty);\n\n  for (const wh of warehouses) {\n    if (remaining <= 0) break;\n    const take = Math.min(remaining, wh.available_qty);\n    itemAllocs.push({\n      product_id: item.product_id,\n      warehouse_id: wh.warehouse_id,\n      allocated_qty: take\n    });\n    remaining -= take;\n  }\n\n  if (remaining > 0) {\n    backorders.push({\n      product_id: item.product_id,\n      quantity_required: item.quantity,\n      quantity_available: item.quantity - remaining,\n      quantity_backorder: remaining\n    });\n  }\n\n  allocations.push(...itemAllocs);\n}\n\nconst fulfillmentType = backorders.length === 0\n  ? 'FULL'\n  : allocations.length > 0\n    ? 'PARTIAL'\n    : 'BACKORDER';\n\nreturn [{\n  json: {\n    ...order,\n    allocations,\n    backorders,\n    fulfillment_type: fulfillmentType,\n    status: fulfillmentType === 'BACKORDER' ? 'BACKORDERED' : 'ALLOCATED',\n    updated_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "compute-allocations",
+      "name": "Compute: Multi-Warehouse Allocations",
+      "type": "n8n-nodes-base.code",
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE inventory SET available_qty = available_qty - alloc.qty, reserved_qty = reserved_qty + alloc.qty, updated_at = NOW() FROM (VALUES {{ $json.allocations.map(a => `('${a.product_id}', '${a.warehouse_id}', ${a.allocated_qty})`).join(',') }}) AS alloc(product_id, warehouse_id, qty) WHERE inventory.product_id = alloc.product_id AND inventory.warehouse_id = alloc.warehouse_id AND inventory.available_qty >= alloc.qty RETURNING inventory.product_id, inventory.warehouse_id, inventory.available_qty;"
+      },
+      "id": "decrement-inventory",
+      "name": "DB: Decrement & Reserve Inventory",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": "public",
+        "table": "orders",
+        "updateKey": "order_id",
+        "columns": "status,allocations,backorders,fulfillment_type,updated_at,history"
+      },
+      "id": "update-order-state",
+      "name": "DB: Update Order State",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "topic": "orders.allocated",
+        "sendInputData": true,
+        "options": {}
+      },
+      "id": "publish-allocated",
+      "name": "Kafka: Publish to orders.allocated",
+      "type": "n8n-nodes-base.kafka",
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.fulfillment_type }}",
+              "value2": "BACKORDER",
+              "operation": "equal"
+            }
+          ]
+        }
+      },
+      "id": "is-backorder",
+      "name": "Is Backorder?",
+      "type": "n8n-nodes-base.if",
+      "position": [1780, 300]
+    },
+    {
+      "parameters": {
+        "topic": "orders.backorder",
+        "sendInputData": true
+      },
+      "id": "publish-backorder",
+      "name": "Kafka: Publish to orders.backorder",
+      "type": "n8n-nodes-base.kafka",
+      "position": [2000, 180]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log backorder notification\nconst order = $input.first().json;\nconsole.log(`Backorder triggered for ${order.order_id}:`, order.backorders);\nreturn [{ json: order }];"
+      },
+      "id": "log-backorder",
+      "name": "Log: Backorder Notification",
+      "type": "n8n-nodes-base.code",
+      "position": [2220, 180]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "allocation_log",
+        "columns": "order_id,allocations,backorders,fulfillment_type,created_at"
+      },
+      "id": "log-allocation",
+      "name": "DB: Log Allocation",
+      "type": "n8n-nodes-base.postgres",
+      "position": [2000, 420]
+    }
+  ],
+  "connections": {
+    "Kafka: Consume orders.validated": {
+      "main": [[{ "node": "Parse: Kafka Message", "type": "main", "index": 0 }]]
+    },
+    "Parse: Kafka Message": {
+      "main": [[{ "node": "DB: Fetch Inventory WITH LOCK", "type": "main", "index": 0 }]]
+    },
+    "DB: Fetch Inventory WITH LOCK": {
+      "main": [[{ "node": "Compute: Multi-Warehouse Allocations", "type": "main", "index": 0 }]]
+    },
+    "Compute: Multi-Warehouse Allocations": {
+      "main": [[{ "node": "DB: Decrement & Reserve Inventory", "type": "main", "index": 0 }]]
+    },
+    "DB: Decrement & Reserve Inventory": {
+      "main": [[{ "node": "DB: Update Order State", "type": "main", "index": 0 }]]
+    },
+    "DB: Update Order State": {
+      "main": [[{ "node": "Kafka: Publish to orders.allocated", "type": "main", "index": 0 }]]
+    },
+    "Kafka: Publish to orders.allocated": {
+      "main": [[{ "node": "Is Backorder?", "type": "main", "index": 0 }]]
+    },
+    "Is Backorder?": {
+      "main": [
+        [{ "node": "Kafka: Publish to orders.backorder", "type": "main", "index": 0 }],
+        [{ "node": "DB: Log Allocation", "type": "main", "index": 0 }]
+      ]
+    },
+    "Kafka: Publish to orders.backorder": {
+      "main": [[{ "node": "Log: Backorder Notification", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "errorWorkflow": "WF7-ErrorHandler" },
+  "meta": { "description": "Consumes validated orders, locks inventory rows, allocates stock across multiple warehouses without going negative, handles partial/full/backorder scenarios, and publishes results downstream." }
+}
