@@ -1,4 +1,4 @@
-# Inventory & Order Lifecycle Automation — Architecture Document **Video walkthrough:** [Watch the Loom recording](https://drive.google.com/file/d/18FkknO2luHviZJojAkbs-Wd_cufiyJCQ/view?usp=sharing)
+# Inventory & Order Lifecycle Automation — Architecture Document **Video walkthrough:** [Watch the recording](https://drive.google.com/file/d/18FkknO2luHviZJojAkbs-Wd_cufiyJCQ/view?usp=sharing)
 
 ## Overview
 
