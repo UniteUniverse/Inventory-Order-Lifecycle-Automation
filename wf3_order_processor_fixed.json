@@ -1,0 +1,306 @@
+{
+  "name": "WF3 - Order Processor",
+  "nodes": [
+    {
+      "parameters": {
+        "topic": "orders.allocated",
+        "groupId": "order-processor",
+        "options": { "autoCommit": false }
+      },
+      "id": "kafka-consume-allocated",
+      "name": "Kafka: Consume orders.allocated",
+      "type": "n8n-nodes-base.kafkaTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const msg = $input.first().json;\nconst order = typeof msg.value === 'string' ? JSON.parse(msg.value) : msg.value;\nreturn [{ json: order }];"
+      },
+      "id": "parse-msg",
+      "name": "Parse: Kafka Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.fulfillment_type }}",
+                    "rightValue": "FULL",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": false,
+              "outputKey": "0"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.fulfillment_type }}",
+                    "rightValue": "PARTIAL",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": false,
+              "outputKey": "1"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.fulfillment_type }}",
+                    "rightValue": "BACKORDER",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": false,
+              "outputKey": "2"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "version": 3
+        }
+      },
+      "id": "route-fulfillment",
+      "name": "Route: Fulfillment Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// FULL FULFILLMENT\nconst order = $input.first().json;\nreturn [{\n  json: {\n    ...order,\n    status: 'PROCESSING',\n    processing_type: 'FULL',\n    invoice_amount: order.allocations.reduce((sum, a) => sum + (a.allocated_qty * (a.unit_price || 0)), 0),\n    updated_at: new Date().toISOString(),\n    history: [...(order.history || []), { status: 'PROCESSING', type: 'FULL', ts: new Date().toISOString() }]\n  }\n}];"
+      },
+      "id": "process-full",
+      "name": "Process: Full Order",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 160]
+    },
+    {
+      "parameters": {
+        "jsCode": "// PARTIAL FULFILLMENT\nconst order = $input.first().json;\nconst primaryOrder = {\n  ...order,\n  order_id: order.order_id,\n  status: 'PROCESSING',\n  processing_type: 'PARTIAL',\n  items: order.allocations,\n  updated_at: new Date().toISOString(),\n  history: [...(order.history || []), { status: 'PROCESSING', type: 'PARTIAL', ts: new Date().toISOString() }]\n};\nconst backorderRecord = {\n  original_order_id: order.order_id,\n  order_id: `${order.order_id}-BO`,\n  customer: order.customer,\n  items: order.backorders.map(b => ({ product_id: b.product_id, quantity: b.quantity_backorder })),\n  priority: order.priority,\n  status: 'BACKORDERED',\n  created_at: new Date().toISOString()\n};\nreturn [\n  { json: primaryOrder },\n  { json: backorderRecord }\n];"
+      },
+      "id": "process-partial",
+      "name": "Process: Partial Order",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// BACKORDER - nothing to ship now\nconst order = $input.first().json;\nreturn [{\n  json: {\n    ...order,\n    status: 'BACKORDERED',\n    processing_type: 'BACKORDER',\n    backorder_created_at: new Date().toISOString(),\n    estimated_restock: null,\n    history: [...(order.history || []), { status: 'BACKORDERED', ts: new Date().toISOString() }]\n  }\n}];"
+      },
+      "id": "process-backorder",
+      "name": "Process: Backorder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 440]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.NOTIFICATION_SERVICE_URL }}/send",
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ type: 'order_confirmation', to: $json.customer.email, order_id: $json.order_id, processing_type: $json.processing_type }) }}",
+        "options": {}
+      },
+      "id": "notify-customer",
+      "name": "HTTP: Notify Customer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1120, 160],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": {
+          "__rl": true,
+          "value": "public",
+          "mode": "list"
+        },
+        "table": {
+          "__rl": true,
+          "value": "orders",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "={{ $json.status }}",
+            "processing_type": "={{ $json.processing_type }}",
+            "updated_at": "={{ $json.updated_at }}",
+            "history": "={{ JSON.stringify($json.history) }}"
+          }
+        },
+        "where": {
+          "values": [
+            {
+              "column": "order_id",
+              "value": "={{ $json.order_id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "db-update-processing",
+      "name": "DB: Update to PROCESSING",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1340, 240]
+    },
+    {
+      "parameters": {
+        "topic": "orders.ready_for_dispatch",
+        "sendInputData": true,
+        "options": {
+          "partitionKey": "={{ $json.priority === 'high' ? '0' : '1' }}"
+        }
+      },
+      "id": "publish-dispatch",
+      "name": "Kafka: Publish to orders.ready_for_dispatch",
+      "type": "n8n-nodes-base.kafka",
+      "typeVersion": 1,
+      "position": [1560, 240]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": {
+          "__rl": true,
+          "value": "public",
+          "mode": "list"
+        },
+        "table": {
+          "__rl": true,
+          "value": "orders",
+          "mode": "list"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "={{ $json.status }}",
+            "backorder_created_at": "={{ $json.backorder_created_at }}",
+            "history": "={{ JSON.stringify($json.history) }}"
+          }
+        },
+        "where": {
+          "values": [
+            {
+              "column": "order_id",
+              "value": "={{ $json.order_id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "db-update-backorder",
+      "name": "DB: Persist Backorder",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1120, 440]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.NOTIFICATION_SERVICE_URL }}/send",
+        "method": "POST",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ type: 'backorder_notice', to: $json.customer.email, order_id: $json.order_id }) }}",
+        "options": {}
+      },
+      "id": "notify-backorder",
+      "name": "HTTP: Notify Backorder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1340, 440],
+      "retryOnFail": true,
+      "maxTries": 3
+    }
+  ],
+  "connections": {
+    "Kafka: Consume orders.allocated": {
+      "main": [[{ "node": "Parse: Kafka Message", "type": "main", "index": 0 }]]
+    },
+    "Parse: Kafka Message": {
+      "main": [[{ "node": "Route: Fulfillment Type", "type": "main", "index": 0 }]]
+    },
+    "Route: Fulfillment Type": {
+      "main": [
+        [{ "node": "Process: Full Order", "type": "main", "index": 0 }],
+        [{ "node": "Process: Partial Order", "type": "main", "index": 0 }],
+        [{ "node": "Process: Backorder", "type": "main", "index": 0 }]
+      ]
+    },
+    "Process: Full Order": {
+      "main": [[{ "node": "HTTP: Notify Customer", "type": "main", "index": 0 }]]
+    },
+    "Process: Partial Order": {
+      "main": [[{ "node": "HTTP: Notify Customer", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Notify Customer": {
+      "main": [[{ "node": "DB: Update to PROCESSING", "type": "main", "index": 0 }]]
+    },
+    "DB: Update to PROCESSING": {
+      "main": [[{ "node": "Kafka: Publish to orders.ready_for_dispatch", "type": "main", "index": 0 }]]
+    },
+    "Process: Backorder": {
+      "main": [[{ "node": "DB: Persist Backorder", "type": "main", "index": 0 }]]
+    },
+    "DB: Persist Backorder": {
+      "main": [[{ "node": "HTTP: Notify Backorder", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "WF7-ErrorHandler"
+  },
+  "meta": {
+    "description": "Routes orders by fulfillment type (FULL/PARTIAL/BACKORDER), creates split orders for partials, notifies customers, and publishes FULL/PARTIAL orders to the dispatch queue.",
+    "templateCredsSetupCompleted": true
+  }
+}
