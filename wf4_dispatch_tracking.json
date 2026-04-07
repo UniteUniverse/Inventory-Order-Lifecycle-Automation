@@ -1,0 +1,198 @@
+{
+  "name": "WF4 - Dispatch & Tracking",
+  "nodes": [
+    {
+      "parameters": {
+        "topic": "orders.ready_for_dispatch",
+        "groupId": "dispatcher",
+        "options": { "autoCommit": false }
+      },
+      "id": "kafka-consume-dispatch",
+      "name": "Kafka: Consume ready_for_dispatch",
+      "type": "n8n-nodes-base.kafkaTrigger",
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const msg = $input.first().json;\nconst order = typeof msg.value === 'string' ? JSON.parse(msg.value) : msg.value;\nreturn [{ json: order }];"
+      },
+      "id": "parse-msg",
+      "name": "Parse: Kafka Message",
+      "type": "n8n-nodes-base.code",
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const order = $input.first().json;\n// Generate tracking ID: TRK-{timestamp}-{random}\nconst trackingId = `TRK-${Date.now()}-${Math.random().toString(36).substr(2, 6).toUpperCase()}`;\nreturn [{\n  json: {\n    ...order,\n    tracking_id: trackingId,\n    dispatch_attempt: 1,\n    dispatched_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "generate-tracking-id",
+      "name": "Generate: Tracking ID",
+      "type": "n8n-nodes-base.code",
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.CARRIER_API_URL }}/shipments",
+        "method": "POST",
+        "jsonParameters": true,
+        "bodyParametersJson": "={{ JSON.stringify({ order_id: $json.order_id, tracking_id: $json.tracking_id, items: $json.allocations, customer_address: $json.customer.address, priority: $json.priority }) }}",
+        "options": { "timeout": 10000 }
+      },
+      "id": "call-carrier-api",
+      "name": "HTTP: Call Carrier API",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [900, 300],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 3000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            { "value1": "={{ $json.statusCode }}", "value2": 200, "operation": "smallerEqual" },
+            { "value1": "={{ $json.statusCode }}", "value2": 299, "operation": "largerEqual" }
+          ]
+        }
+      },
+      "id": "carrier-success",
+      "name": "Carrier API Success?",
+      "type": "n8n-nodes-base.if",
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": "public",
+        "table": "orders",
+        "updateKey": "order_id",
+        "columns": "status,tracking_id,dispatched_at,updated_at,history"
+      },
+      "id": "db-update-dispatched",
+      "name": "DB: Update to DISPATCHED",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1340, 180]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "tracking",
+        "columns": "tracking_id,order_id,carrier_reference,status,created_at,updated_at",
+        "additionalFields": {}
+      },
+      "id": "db-create-tracking",
+      "name": "DB: Create Tracking Record",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1560, 180]
+    },
+    {
+      "parameters": {
+        "topic": "orders.dispatched",
+        "sendInputData": true
+      },
+      "id": "publish-dispatched",
+      "name": "Kafka: Publish orders.dispatched",
+      "type": "n8n-nodes-base.kafka",
+      "position": [1780, 180]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.NOTIFICATION_SERVICE_URL }}/send",
+        "method": "POST",
+        "jsonParameters": true,
+        "bodyParametersJson": "={{ JSON.stringify({ type: 'dispatch_confirmation', to: $json.customer.email, order_id: $json.order_id, tracking_id: $json.tracking_id }) }}"
+      },
+      "id": "notify-dispatched",
+      "name": "HTTP: Notify Customer Dispatch",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [2000, 180],
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "jsCode": "// Carrier API failed after all retries - send to dead-letter\nconst order = $input.first().json;\nreturn [{\n  json: {\n    ...order,\n    status: 'DISPATCH_FAILED',\n    failure_reason: 'Carrier API unreachable after max retries',\n    failed_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "handle-carrier-failure",
+      "name": "Handle: Carrier API Failure",
+      "type": "n8n-nodes-base.code",
+      "position": [1340, 420]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": "public",
+        "table": "orders",
+        "updateKey": "order_id",
+        "columns": "status,failure_reason,failed_at,updated_at"
+      },
+      "id": "db-update-failed",
+      "name": "DB: Mark DISPATCH_FAILED",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1560, 420]
+    },
+    {
+      "parameters": {
+        "topic": "orders.dead_letter",
+        "sendInputData": true
+      },
+      "id": "publish-dead-letter",
+      "name": "Kafka: Publish to dead_letter",
+      "type": "n8n-nodes-base.kafka",
+      "position": [1780, 420]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "channel": "{{ $env.SLACK_OPS_CHANNEL }}",
+        "text": "=:rotating_light: DISPATCH FAILURE\\nOrder: {{ $json.order_id }}\\nTracking: {{ $json.tracking_id }}\\nReason: {{ $json.failure_reason }}\\nTime: {{ $json.failed_at }}"
+      },
+      "id": "alert-ops",
+      "name": "Slack: Alert Ops Team",
+      "type": "n8n-nodes-base.slack",
+      "position": [2000, 420]
+    }
+  ],
+  "connections": {
+    "Kafka: Consume ready_for_dispatch": {
+      "main": [[{ "node": "Parse: Kafka Message", "type": "main", "index": 0 }]]
+    },
+    "Parse: Kafka Message": {
+      "main": [[{ "node": "Generate: Tracking ID", "type": "main", "index": 0 }]]
+    },
+    "Generate: Tracking ID": {
+      "main": [[{ "node": "HTTP: Call Carrier API", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Call Carrier API": {
+      "main": [[{ "node": "Carrier API Success?", "type": "main", "index": 0 }]]
+    },
+    "Carrier API Success?": {
+      "main": [
+        [{ "node": "DB: Update to DISPATCHED", "type": "main", "index": 0 }],
+        [{ "node": "Handle: Carrier API Failure", "type": "main", "index": 0 }]
+      ]
+    },
+    "DB: Update to DISPATCHED": {
+      "main": [[{ "node": "DB: Create Tracking Record", "type": "main", "index": 0 }]]
+    },
+    "DB: Create Tracking Record": {
+      "main": [[{ "node": "Kafka: Publish orders.dispatched", "type": "main", "index": 0 }]]
+    },
+    "Kafka: Publish orders.dispatched": {
+      "main": [[{ "node": "HTTP: Notify Customer Dispatch", "type": "main", "index": 0 }]]
+    },
+    "Handle: Carrier API Failure": {
+      "main": [[{ "node": "DB: Mark DISPATCH_FAILED", "type": "main", "index": 0 }]]
+    },
+    "DB: Mark DISPATCH_FAILED": {
+      "main": [[{ "node": "Kafka: Publish to dead_letter", "type": "main", "index": 0 }]]
+    },
+    "Kafka: Publish to dead_letter": {
+      "main": [[{ "node": "Slack: Alert Ops Team", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "errorWorkflow": "WF7-ErrorHandler" },
+  "meta": { "description": "Generates tracking IDs, calls carrier API with retry logic (5 attempts, 3s backoff), handles carrier failures via dead-letter queue and Slack alerting, persists tracking records." }
+}

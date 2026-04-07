@@ -1,0 +1,162 @@
+{
+  "name": "WF5 - Async Delivery Tracker",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 15 }] }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule: Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT t.tracking_id, t.order_id, t.carrier_reference, t.status, o.customer_email FROM tracking t JOIN orders o ON t.order_id = o.order_id WHERE t.status NOT IN ('DELIVERED', 'FAILED', 'CANCELLED') AND t.updated_at < NOW() - INTERVAL '15 minutes' ORDER BY o.priority DESC, t.created_at ASC LIMIT 100;"
+      },
+      "id": "fetch-active-shipments",
+      "name": "DB: Fetch Active Shipments",
+      "type": "n8n-nodes-base.postgres",
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 10,
+        "options": {}
+      },
+      "id": "split-batches",
+      "name": "Split: Into Batches of 10",
+      "type": "n8n-nodes-base.splitInBatches",
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.CARRIER_TRACKING_API_URL }}/status/{{ $json.carrier_reference }}",
+        "method": "GET",
+        "options": { "timeout": 8000 }
+      },
+      "id": "poll-carrier-status",
+      "name": "HTTP: Poll Carrier Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [900, 300],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "const trackingRecord = $('Split: Into Batches of 10').first().json;\nconst apiResponse = $input.first().json;\n\n// Map carrier status to internal status\nconst statusMap = {\n  'in_transit': 'IN_TRANSIT',\n  'out_for_delivery': 'OUT_FOR_DELIVERY',\n  'delivered': 'DELIVERED',\n  'failed_delivery': 'DELIVERY_FAILED',\n  'exception': 'DELIVERY_EXCEPTION'\n};\n\nconst newStatus = statusMap[apiResponse.status] || trackingRecord.status;\nconst statusChanged = newStatus !== trackingRecord.status;\n\nreturn [{\n  json: {\n    tracking_id: trackingRecord.tracking_id,\n    order_id: trackingRecord.order_id,\n    customer_email: trackingRecord.customer_email,\n    old_status: trackingRecord.status,\n    new_status: newStatus,\n    status_changed: statusChanged,\n    carrier_data: apiResponse,\n    updated_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "map-status",
+      "name": "Map: Carrier Status to Internal",
+      "type": "n8n-nodes-base.code",
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [{ "value1": "={{ $json.status_changed }}", "value2": true, "operation": "equal" }]
+        }
+      },
+      "id": "status-changed",
+      "name": "Status Changed?",
+      "type": "n8n-nodes-base.if",
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE tracking SET status = '{{ $json.new_status }}', carrier_data = '{{ JSON.stringify($json.carrier_data) }}', updated_at = NOW() WHERE tracking_id = '{{ $json.tracking_id }}';\nUPDATE orders SET status = '{{ $json.new_status === \"DELIVERED\" ? \"DELIVERED\" : \"IN_TRANSIT\" }}', updated_at = NOW() WHERE order_id = '{{ $json.order_id }}';"
+      },
+      "id": "db-update-tracking",
+      "name": "DB: Update Tracking Status",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1560, 180]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.NOTIFICATION_SERVICE_URL }}/send",
+        "method": "POST",
+        "jsonParameters": true,
+        "bodyParametersJson": "={{ JSON.stringify({ type: 'tracking_update', to: $json.customer_email, order_id: $json.order_id, tracking_id: $json.tracking_id, new_status: $json.new_status }) }}"
+      },
+      "id": "notify-status-change",
+      "name": "HTTP: Notify Customer Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "position": [1780, 180],
+      "retryOnFail": true,
+      "maxTries": 3
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [{ "value1": "={{ $json.new_status }}", "value2": "DELIVERED", "operation": "equal" }]
+        }
+      },
+      "id": "is-delivered",
+      "name": "Is Delivered?",
+      "type": "n8n-nodes-base.if",
+      "position": [2000, 180]
+    },
+    {
+      "parameters": {
+        "topic": "orders.delivered",
+        "sendInputData": true
+      },
+      "id": "publish-delivered",
+      "name": "Kafka: Publish orders.delivered",
+      "type": "n8n-nodes-base.kafka",
+      "position": [2220, 60]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "tracking_history",
+        "columns": "tracking_id,order_id,old_status,new_status,carrier_data,recorded_at"
+      },
+      "id": "log-tracking-history",
+      "name": "DB: Log Tracking History",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1560, 420]
+    }
+  ],
+  "connections": {
+    "Schedule: Every 15 Minutes": {
+      "main": [[{ "node": "DB: Fetch Active Shipments", "type": "main", "index": 0 }]]
+    },
+    "DB: Fetch Active Shipments": {
+      "main": [[{ "node": "Split: Into Batches of 10", "type": "main", "index": 0 }]]
+    },
+    "Split: Into Batches of 10": {
+      "main": [[{ "node": "HTTP: Poll Carrier Status", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Poll Carrier Status": {
+      "main": [[{ "node": "Map: Carrier Status to Internal", "type": "main", "index": 0 }]]
+    },
+    "Map: Carrier Status to Internal": {
+      "main": [[{ "node": "Status Changed?", "type": "main", "index": 0 }]]
+    },
+    "Status Changed?": {
+      "main": [
+        [{ "node": "DB: Update Tracking Status", "type": "main", "index": 0 }],
+        [{ "node": "DB: Log Tracking History", "type": "main", "index": 0 }]
+      ]
+    },
+    "DB: Update Tracking Status": {
+      "main": [[{ "node": "HTTP: Notify Customer Status", "type": "main", "index": 0 }]]
+    },
+    "HTTP: Notify Customer Status": {
+      "main": [[{ "node": "Is Delivered?", "type": "main", "index": 0 }]]
+    },
+    "Is Delivered?": {
+      "main": [
+        [{ "node": "Kafka: Publish orders.delivered", "type": "main", "index": 0 }],
+        []
+      ]
+    }
+  },
+  "settings": { "errorWorkflow": "WF7-ErrorHandler" },
+  "meta": { "description": "Scheduled every 15 minutes. Polls carrier API for all active shipments in batches, maps statuses, updates DB only on changes, notifies customers of status transitions, publishes delivery events." }
+}

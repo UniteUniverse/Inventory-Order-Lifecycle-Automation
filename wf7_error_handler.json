@@ -1,0 +1,160 @@
+{
+  "name": "WF7 - Global Error Handler",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "error-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const error = $input.first().json;\nconst execution = error.execution || {};\nconst workflow = error.workflow || {};\n\nreturn [{\n  json: {\n    error_id: `ERR-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,\n    workflow_name: workflow.name || 'unknown',\n    workflow_id: workflow.id || 'unknown',\n    execution_id: execution.id || 'unknown',\n    error_message: error.lastNodeExecuted ? `Node '${error.lastNodeExecuted}' failed: ${error.error?.message || 'Unknown error'}` : 'Workflow error',\n    error_stack: error.error?.stack || null,\n    order_id: execution.data?.resultData?.runData ? Object.values(execution.data.resultData.runData).flat().find(r => r?.data?.main?.[0]?.[0]?.json?.order_id)?.data?.main?.[0]?.[0]?.json?.order_id || null : null,\n    failed_at: new Date().toISOString(),\n    raw_error: JSON.stringify(error).substring(0, 2000)\n  }\n}];"
+      },
+      "id": "parse-error",
+      "name": "Parse: Error Context",
+      "type": "n8n-nodes-base.code",
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "error_log",
+        "columns": "error_id,workflow_name,workflow_id,execution_id,error_message,order_id,failed_at,raw_error"
+      },
+      "id": "db-log-error",
+      "name": "DB: Persist Error Log",
+      "type": "n8n-nodes-base.postgres",
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            { "value1": "={{ $json.order_id }}", "operation": "isNotEmpty" }
+          ]
+        }
+      },
+      "id": "has-order-id",
+      "name": "Has Order ID?",
+      "type": "n8n-nodes-base.if",
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE orders SET status = 'FAILED', failure_reason = '{{ $json.error_message }}', error_id = '{{ $json.error_id }}', updated_at = NOW() WHERE order_id = '{{ $json.order_id }}' AND status NOT IN ('DELIVERED', 'CANCELLED');"
+      },
+      "id": "db-mark-order-failed",
+      "name": "DB: Mark Order FAILED",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1120, 180]
+    },
+    {
+      "parameters": {
+        "topic": "orders.dead_letter",
+        "sendInputData": true
+      },
+      "id": "publish-dead-letter",
+      "name": "Kafka: Dead Letter Queue",
+      "type": "n8n-nodes-base.kafka",
+      "position": [1340, 180]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "channel": "={{ $env.SLACK_ERRORS_CHANNEL }}",
+        "text": "=:x: *WORKFLOW ERROR*\n*Workflow:* {{ $json.workflow_name }}\n*Error ID:* {{ $json.error_id }}\n*Order ID:* {{ $json.order_id || 'N/A' }}\n*Message:* {{ $json.error_message }}\n*Time:* {{ $json.failed_at }}\n*Execution:* {{ $json.execution_id }}"
+      },
+      "id": "slack-error-alert",
+      "name": "Slack: Error Alert",
+      "type": "n8n-nodes-base.slack",
+      "position": [1120, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Determine if error is retryable\nconst error = $input.first().json;\nconst retryablePatterns = ['timeout', 'ECONNREFUSED', 'ENOTFOUND', 'rate limit', '429', '503', '504'];\nconst isRetryable = retryablePatterns.some(p => (error.error_message || '').toLowerCase().includes(p.toLowerCase()));\n\nreturn [{\n  json: {\n    ...error,\n    is_retryable: isRetryable,\n    retry_at: isRetryable ? new Date(Date.now() + 5 * 60 * 1000).toISOString() : null\n  }\n}];"
+      },
+      "id": "classify-error",
+      "name": "Classify: Retryable?",
+      "type": "n8n-nodes-base.code",
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [{ "value1": "={{ $json.is_retryable }}", "value2": true }]
+        }
+      },
+      "id": "should-retry",
+      "name": "Should Retry?",
+      "type": "n8n-nodes-base.if",
+      "position": [1780, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "retry_queue",
+        "columns": "error_id,order_id,workflow_name,retry_at,created_at"
+      },
+      "id": "db-enqueue-retry",
+      "name": "DB: Enqueue for Retry",
+      "type": "n8n-nodes-base.postgres",
+      "position": [2000, 180]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": "public",
+        "table": "error_log",
+        "updateKey": "error_id",
+        "columns": "is_retryable,retry_at"
+      },
+      "id": "db-update-error-log",
+      "name": "DB: Update Error as Terminal",
+      "type": "n8n-nodes-base.postgres",
+      "position": [2000, 420]
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [[{ "node": "Parse: Error Context", "type": "main", "index": 0 }]]
+    },
+    "Parse: Error Context": {
+      "main": [[{ "node": "DB: Persist Error Log", "type": "main", "index": 0 }]]
+    },
+    "DB: Persist Error Log": {
+      "main": [[{ "node": "Has Order ID?", "type": "main", "index": 0 }]]
+    },
+    "Has Order ID?": {
+      "main": [
+        [{ "node": "DB: Mark Order FAILED", "type": "main", "index": 0 }],
+        [{ "node": "Slack: Error Alert", "type": "main", "index": 0 }]
+      ]
+    },
+    "DB: Mark Order FAILED": {
+      "main": [[{ "node": "Kafka: Dead Letter Queue", "type": "main", "index": 0 }]]
+    },
+    "Kafka: Dead Letter Queue": {
+      "main": [[{ "node": "Slack: Error Alert", "type": "main", "index": 0 }]]
+    },
+    "Slack: Error Alert": {
+      "main": [[{ "node": "Classify: Retryable?", "type": "main", "index": 0 }]]
+    },
+    "Classify: Retryable?": {
+      "main": [[{ "node": "Should Retry?", "type": "main", "index": 0 }]]
+    },
+    "Should Retry?": {
+      "main": [
+        [{ "node": "DB: Enqueue for Retry", "type": "main", "index": 0 }],
+        [{ "node": "DB: Update Error as Terminal", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {},
+  "meta": { "description": "Global error handler registered as errorWorkflow on all other workflows. Parses error context, logs to DB, marks affected orders as FAILED, publishes to dead-letter queue, alerts Slack, and classifies errors as retryable or terminal." }
+}

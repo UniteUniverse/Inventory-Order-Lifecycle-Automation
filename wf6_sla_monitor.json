@@ -1,0 +1,133 @@
+{
+  "name": "WF6 - SLA Monitor & Escalation",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 30 }] }
+      },
+      "id": "schedule-sla",
+      "name": "Schedule: Every 30 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT o.order_id, o.status, o.priority, o.customer_email, o.customer_name, o.created_at, o.updated_at, EXTRACT(EPOCH FROM (NOW() - o.updated_at))/3600 AS hours_in_status FROM orders o WHERE o.status NOT IN ('DELIVERED', 'CANCELLED', 'FAILED', 'DUPLICATE') AND (   (o.priority = 'high'    AND o.status = 'RECEIVED'    AND o.created_at < NOW() - INTERVAL '1 hour')  OR (o.priority = 'high'    AND o.status = 'ALLOCATED'   AND o.updated_at < NOW() - INTERVAL '2 hours') OR (o.priority = 'high'    AND o.status = 'PROCESSING'  AND o.updated_at < NOW() - INTERVAL '2 hours') OR (o.priority = 'high'    AND o.status = 'DISPATCHED'  AND o.updated_at < NOW() - INTERVAL '24 hours') OR (o.priority = 'normal'   AND o.status = 'RECEIVED'    AND o.created_at < NOW() - INTERVAL '4 hours')  OR (o.priority = 'normal'   AND o.status IN ('ALLOCATED','PROCESSING') AND o.updated_at < NOW() - INTERVAL '8 hours')  OR (o.priority = 'normal'   AND o.status = 'DISPATCHED'  AND o.updated_at < NOW() - INTERVAL '72 hours') OR o.status = 'DISPATCH_FAILED' OR (o.status = 'BACKORDERED'  AND o.updated_at < NOW() - INTERVAL '48 hours') ) ORDER BY o.priority DESC, o.updated_at ASC;"
+      },
+      "id": "find-sla-breaches",
+      "name": "DB: Find SLA Breaches",
+      "type": "n8n-nodes-base.postgres",
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [{ "value1": "={{ $input.all().length }}", "value2": 0, "operation": "larger" }]
+        }
+      },
+      "id": "has-breaches",
+      "name": "Any SLA Breaches?",
+      "type": "n8n-nodes-base.if",
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const orders = $input.all().map(i => i.json);\n\nconst escalations = orders.map(o => ({\n  ...o,\n  escalation_level: o.priority === 'high' ? 'CRITICAL' : 'WARNING',\n  escalation_reason: getEscalationReason(o),\n  escalated_at: new Date().toISOString()\n}));\n\nfunction getEscalationReason(o) {\n  if (o.status === 'DISPATCH_FAILED') return 'Carrier API failure - needs manual intervention';\n  if (o.status === 'BACKORDERED') return `Backorder unresolved for ${Math.round(o.hours_in_status)}h`;\n  return `Order stuck in ${o.status} for ${Math.round(o.hours_in_status)}h (SLA breach)`;\n}\n\nreturn escalations.map(e => ({ json: e }));"
+      },
+      "id": "build-escalations",
+      "name": "Build: Escalation Payloads",
+      "type": "n8n-nodes-base.code",
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "channel": "={{ $env.SLACK_OPS_CHANNEL }}",
+        "text": "={{ $json.escalation_level === 'CRITICAL' ? ':red_circle:' : ':warning:' }} *SLA BREACH* | {{ $json.escalation_level }}\n*Order:* {{ $json.order_id }}\n*Status:* {{ $json.status }}\n*Priority:* {{ $json.priority }}\n*Customer:* {{ $json.customer_name }}\n*Reason:* {{ $json.escalation_reason }}\n*Stuck for:* {{ Math.round($json.hours_in_status) }}h"
+      },
+      "id": "slack-escalate",
+      "name": "Slack: Escalation Alert",
+      "type": "n8n-nodes-base.slack",
+      "position": [1120, 180]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "escalation_log",
+        "columns": "order_id,status,priority,escalation_level,escalation_reason,hours_in_status,escalated_at"
+      },
+      "id": "db-log-escalation",
+      "name": "DB: Log Escalation",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1120, 420]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "schema": "public",
+        "table": "orders",
+        "updateKey": "order_id",
+        "columns": "status,escalated_at,history"
+      },
+      "id": "db-mark-escalated",
+      "name": "DB: Mark ESCALATED",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Summary report for ops dashboard\nconst items = $input.all().map(i => i.json);\nconst critical = items.filter(i => i.escalation_level === 'CRITICAL').length;\nconst warning = items.filter(i => i.escalation_level === 'WARNING').length;\nreturn [{ json: { total: items.length, critical, warning, run_at: new Date().toISOString() } }];"
+      },
+      "id": "sla-summary",
+      "name": "Build: SLA Summary Report",
+      "type": "n8n-nodes-base.code",
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "schema": "public",
+        "table": "sla_reports",
+        "columns": "total_breaches,critical_count,warning_count,run_at"
+      },
+      "id": "db-sla-report",
+      "name": "DB: Store SLA Report",
+      "type": "n8n-nodes-base.postgres",
+      "position": [1780, 300]
+    }
+  ],
+  "connections": {
+    "Schedule: Every 30 Minutes": {
+      "main": [[{ "node": "DB: Find SLA Breaches", "type": "main", "index": 0 }]]
+    },
+    "DB: Find SLA Breaches": {
+      "main": [[{ "node": "Any SLA Breaches?", "type": "main", "index": 0 }]]
+    },
+    "Any SLA Breaches?": {
+      "main": [
+        [{ "node": "Build: Escalation Payloads", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Build: Escalation Payloads": {
+      "main": [
+        [{ "node": "Slack: Escalation Alert", "type": "main", "index": 0 }],
+        [{ "node": "DB: Log Escalation", "type": "main", "index": 0 }]
+      ]
+    },
+    "Slack: Escalation Alert": {
+      "main": [[{ "node": "DB: Mark ESCALATED", "type": "main", "index": 0 }]]
+    },
+    "DB: Mark ESCALATED": {
+      "main": [[{ "node": "Build: SLA Summary Report", "type": "main", "index": 0 }]]
+    },
+    "Build: SLA Summary Report": {
+      "main": [[{ "node": "DB: Store SLA Report", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {},
+  "meta": { "description": "Scheduled every 30 minutes. Queries orders breaching SLA thresholds by priority and status stage, sends tiered Slack alerts (CRITICAL/WARNING), logs escalations, and stores summary reports." }
+}
